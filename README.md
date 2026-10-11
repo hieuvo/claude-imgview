@@ -52,6 +52,85 @@ This plugin is a _mod_: a hooks module the engine loads (`hooks/hooks.json` name
 The slash command is the person's; its one-line answer (`login.png · 1280×720 · cells`)
 is recorded in the transcript as any command's output is.
 
+## What the mod reads, runs and sends
+
+**It sends nothing.** The module makes no network call and no model call. `claude plugin
+validate .` prints every engine call it makes: `$.clock`, `$.command.register`,
+`$.env.get`, `$.fs.stat`, `$.fs.exists`, `$.fs.read`, `$.process.run`, `$.state` and
+`$.ui`. The one way out of the module is `$.process.run`, and all it starts are the six
+local commands below.
+
+### The programs it starts
+
+Every command goes through one function (`run` in `session.start`, `hooks/register.tsx`)
+as an argument list. No command line is assembled from a path, and the one shell script
+is fixed text that takes its two paths as positional arguments.
+
+```
+sips -g format -g pixelWidth -g pixelHeight <file>
+sips -s format <bmp or png> [-z <height> <width>] <file> --out <temp>
+magick identify -format "%w %h %m" <file>[0]
+magick <file>[0] [-resize <width>x<height>!] <temp>
+/bin/sh -c 'set -C; { cat -- "$1" || exit 4; } >"$2" || exit 3' sh <file> <temp>
+rm -f <temp>...
+```
+
+- `sips` measures a picture and converts it to the size on screen. It is the converter
+  macOS ships.
+- `magick` (ImageMagick) does the same where `sips` cannot read the file, for `/img` and
+  a clicked chip only. It is not run for a hover card.
+- `/bin/sh` runs `cat` to copy a file a reply named, before anything decodes it (see
+  "What a reply can make the mod open").
+- `rm -f` removes the mod's own temporary files, by the exact paths it wrote down.
+
+`<file>` is the picture: the path you gave `/img`, or for a hover card a file inside the
+working directory that a reply named, and then the mod's copy of it. `<temp>` is a file
+of the mod's own, `$TMPDIR/claude-imgview-<random uuid>` with the suffix `.snap`, `.bmp`
+or `.png`.
+
+No program is given an address. A web address in a reply is skipped
+(`path.includes("://")` in `hooks/picture.ts`), and `/img` opens only what the file
+system says is a regular file. What `sips` and ImageMagick do with a file's content is
+theirs: a hover card is made from a bitmap alone, by the format `sips` itself names, but
+`/img` on an SVG you name hands that SVG to them.
+
+### What it reads
+
+- **The conversation:** the text of each of Claude's replies as it is drawn
+  (`e.props.text` in the `ui.render` hook), to find the image paths in it
+  (`findImagePaths`). The text is not kept, not written to the session's state and not
+  passed to any program. The paths found are kept in memory, 128 at most.
+- **Files:** what a path leads to (`$.fs.stat`), whether a converter wrote its output
+  (`$.fs.exists`), and the bytes of the bitmap it just had converted (`$.fs.read`, on its
+  own `.bmp` alone). The pictures themselves are read by the programs above.
+- **The environment**, none of it a credential:
+
+  | Variable                                  | Used for                                                                                                 |
+  | ----------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+  | `HOME`                                    | expanding `~` in a path                                                                                  |
+  | `TMPDIR`                                  | where the temporary files go                                                                             |
+  | `TERM`, `TERM_PROGRAM`, `KITTY_WINDOW_ID` | whether the terminal is kitty or Ghostty, which draw pixels                                              |
+  | `TMUX`                                    | whether it is set: tmux passes no pictures through                                                       |
+  | `SSH_CONNECTION`, `SSH_CLIENT`, `SSH_TTY` | whether one is set: across ssh the terminal cannot read this machine's files. Their values are not used. |
+
+- **The session's state**, which it also writes: `imgview.shown`, the picture the pane
+  shows (its path, name, size, modification time and mode), and `imgview.temps`, the
+  paths of its temporary files (`types/index.d.ts`).
+
+### What it hooks and adds
+
+- It adds one command, `/img`, and no tool and no agent.
+- `command.run`, for `img` alone (`{ command: "img" }`): it answers its own command.
+  Other code that runs `/img` gets the same answer; no other command reaches the hook.
+- `ui.render` for `AssistantMessage`: it returns the row the engine drew with a row of
+  chips under it. It does not change the reply's text, and nothing it draws is read by
+  the model.
+- `ui.render` for its own pane (`Pane`, `imgview`): it draws the picture.
+- `classic.CwdChanged`: it reads the new working directory, to move the boundary of what
+  a reply may preview, and passes the event on unchanged (`next(e)`).
+- `session.start` and `session.end`: it sets itself up and removes its temporary files,
+  and passes both events on unchanged.
+
 ## The hover card
 
 The chip is the hover target, not the path inside Claude's sentence: the reply's own

@@ -1,7 +1,7 @@
 {
   "name": "imgview",
   "description": "Preview images inside Claude Code: hover the chip under a reply that names an image file in the working directory to pop its picture up, or open one in a pane with /img <path>. Pixels on kitty and Ghostty, colored block characters on every other terminal.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "author": {
     "name": "hieuvo"
   },
