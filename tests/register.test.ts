@@ -91,6 +91,8 @@ function world(
     isPipeAtCopy?: boolean;
     // While this says so `rm` fails, and removes nothing.
     rm?: { isFailing: boolean };
+    // The files removed since the test began: nothing finds or converts one.
+    gone?: Set<string>;
     // Looking at this path waits at this gate.
     statGate?: { path: string; gate: Promise<void> };
     // Looking at a copy of this file waits at this gate.
@@ -188,7 +190,8 @@ function world(
         e.path === realOf(key) ||
         (!key.startsWith("/") && e.path.endsWith(`/${key}`)),
     );
-    if (name === undefined) return { deny: "no such file" };
+    if (name === undefined || extra.gone?.has(name) === true)
+      return { deny: "no such file" };
     const kind = files[name];
     if (kind === "dir")
       return { value: { ...directory, realPath: realOf(name) } };
@@ -256,7 +259,10 @@ function world(
     peak = Math.max(peak, running);
     try {
       const source = e.argv.map(nameAt).find((name) => name !== undefined);
-      const kind = source === undefined ? undefined : files[source];
+      const kind =
+        source === undefined || extra.gone?.has(source) === true
+          ? undefined
+          : files[source];
       const isPicture = kind !== undefined && kind !== "text" && kind !== "dir";
       if (e.argv[1] === "-g") {
         const suffix = source?.split(".").pop() ?? "";
@@ -319,6 +325,19 @@ function world(
   });
   // Whether the pane is up: opened, and not closed by the test since.
   const pane = { isUp: false };
+  const toasts: string[] = [];
+  on("ui.toast", (_$, e) => {
+    toasts.push(e.text);
+
+    return { value: undefined };
+  });
+  // The system prompt as the engine composes it, before the mod's hook.
+  on("prompt.compose", () => ({
+    sections: [
+      { id: "intro", text: "You are Claude Code.", scope: "shared" as const },
+      { id: "env", text: "cwd: /work", scope: "session" as const },
+    ],
+  }));
   on("ui.open", (_$, e) => {
     opened.push(e);
     pane.isUp = true;
@@ -344,6 +363,7 @@ function world(
     close: () => {
       pane.isUp = false;
     },
+    toasts,
     clock,
     runs,
     timeouts,
@@ -849,7 +869,7 @@ test("removes the PNG it converted when another picture replaces it, and never a
 
 // Codex review, round 1, finding 2: what a reply names is looked at with no
 // action of the person's, so only a bitmap inside the working directory is.
-test("previews no file outside the working directory, by its path or through a link", async ($, on) => {
+test("previews no file outside the working directory, by its path or through a link: a chip to click, saying where the file is", async ($, on) => {
   const { runs } = world(on, {
     "/etc/outside.png": "image",
     "/home/me/mine.png": "image",
@@ -858,9 +878,108 @@ test("previews no file outside the working directory, by its path or through a l
   await start($);
 
   const ui = await reply($, "See /etc/outside.png, ~/mine.png and escape.png.");
-  expect(await ui.findAll({ type: "Button" })).toHaveLength(0);
-  expect(await ui.drawn()).toMatchObject({ type: "Text" });
+  expect(
+    (await ui.findAll({ type: "Button" })).map((chip) => chip.props.label),
+  ).toEqual(["▣ /etc/outside.png", "▣ ~/mine.png", "▣ /elsewhere/escape.png"]);
+  // No card is begun for any of them, and none is promised.
+  expect(await cards(ui)).toHaveLength(0);
   expect(runs).toHaveLength(0);
+});
+
+test("opens a file outside the working directory when its chip is clicked, having run nothing for it before", async ($, on) => {
+  const { runs, opened } = world(on, { "/photos/cat.jpg": "image" });
+  await start($);
+
+  const ui = await reply($, "See /photos/cat.jpg.");
+  expect(runs).toHaveLength(0);
+  await ui.press({ key: "imgview-open-0" });
+  expect(opened).toHaveLength(1);
+  expect(opened[0]).toMatchObject({ id: "imgview", title: "cat.jpg" });
+  expect(runs.map((argv) => argv.at(-1))).toEqual(["/photos/cat.jpg"]);
+});
+
+test("labels the chip of a file outside the working directory with the end of a long path", async ($, on) => {
+  const path =
+    "/var/folders/aa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/T/screens/shot.png";
+  world(on, { [path]: "image" });
+  await start($);
+
+  const ui = await reply($, `Saved to ${path}.`);
+  const label = String((await ui.find({ type: "Button" }))?.props.label);
+  // The mark, an ellipsis and the last 39 characters: 40 for the path.
+  expect(label).toBe(`▣ …${path.slice(-39)}`);
+  expect(label.endsWith("/T/screens/shot.png")).toBe(true);
+});
+
+test("says why in a toast when a clicked chip opens nothing", async ($, on) => {
+  const { opened, toasts } = world(on, {
+    "/out/fake.png": "text",
+    "/out/gone.png": "piped",
+  });
+  await start($);
+
+  // Neither file was looked into before the click: one is no picture, and
+  // the other is a file no longer.
+  const ui = await reply($, "See /out/fake.png and /out/gone.png.");
+  await ui.press({ key: "imgview-open-0" });
+  expect(toasts).toEqual([
+    "imgview: not an image sips or ImageMagick can read: fake.png",
+  ]);
+  await ui.press({ key: "imgview-open-1" });
+  expect(toasts.at(-1)).toBe("imgview: not a file any more: gone.png");
+  expect(opened).toHaveLength(0);
+});
+
+test("says so in a toast when a clicked chip's picture converts to no PNG for a pixel terminal", async ($, on) => {
+  const { opened, toasts } = world(
+    on,
+    { "/photos/cat.jpg": "image" },
+    { TERM: "xterm-kitty" },
+    false,
+  );
+  await start($);
+
+  const ui = await reply($, "See /photos/cat.jpg.");
+  await ui.press({ key: "imgview-open-0" });
+  expect(toasts).toEqual(["imgview: could not convert to PNG: cat.jpg"]);
+  expect(opened).toHaveLength(0);
+});
+
+test("ends the system prompt with one section on a terminal, and leaves it alone elsewhere", async ($, on) => {
+  world(on, {});
+  await start($);
+
+  const facts = {
+    model: "claude-test",
+    promptModel: "claude-test",
+    tools: [],
+    outputStyle: null,
+    traits: [],
+  };
+  const composed = await $.prompt.compose({ ...facts, surfaces: ["terminal"] });
+  expect(composed.sections.map((section) => section.id)).toEqual([
+    "intro",
+    "env",
+    "imgview:paths",
+  ]);
+  const hint = composed.sections.at(-1)!;
+  expect(hint.scope).toBe("session");
+  expect(hint.text).toMatch(/^The imgview plugin is installed\./);
+  expect(hint.text).toMatch(/write its full path in the reply/);
+  // What the engine composed is as it was.
+  expect(composed.sections[0]).toEqual({
+    id: "intro",
+    text: "You are Claude Code.",
+    scope: "shared",
+  });
+
+  for (const surfaces of [[], ["desktop"]] as const) {
+    const elsewhere = await $.prompt.compose({ ...facts, surfaces });
+    expect(elsewhere.sections.map((section) => section.id)).toEqual([
+      "intro",
+      "env",
+    ]);
+  }
 });
 
 test("previews bitmaps only: no SVG by its suffix, no PDF by its content", async ($, on) => {
@@ -1176,14 +1295,17 @@ test("moves the previews' boundary with the working directory", async ($, on) =>
   const labels = async (ui: Awaited<ReturnType<typeof reply>>) =>
     (await ui.findAll({ type: "Button" })).map((chip) => chip.props.label);
 
+  // The file inside has a card; the one outside a chip that says where it is.
   const before = await reply($, "/work/a.png and /other/b.png");
-  expect(await labels(before)).toEqual(["▣ a.png"]);
+  expect(await labels(before)).toEqual(["▣ a.png", "▣ /other/b.png"]);
+  expect(await cards(before)).toHaveLength(1);
   await before.unmount();
 
   await $.classic.CwdChanged({ old_cwd: "/work", new_cwd: "/other" });
   const after = await reply($, "/work/a.png and /other/b.png");
-  expect(await labels(after)).toEqual(["▣ b.png"]);
+  expect(await labels(after)).toEqual(["▣ /work/a.png", "▣ b.png"]);
   expect(await after.findAll({ type: "Raster" })).toHaveLength(1);
+  expect(await cards(after)).toHaveLength(1);
 });
 
 // Codex review, round 2, finding 4.
@@ -1419,10 +1541,12 @@ test("keeps the working directory changed to last, whichever is resolved last", 
   open();
   await first;
 
+  // b.png is inside the directory changed to last; a.png is outside it.
   const ui = await reply($, "/work/sub/a.png and /other/b.png");
   expect(
     (await ui.findAll({ type: "Button" })).map((chip) => chip.props.label),
-  ).toEqual(["▣ b.png"]);
+  ).toEqual(["▣ /work/sub/a.png", "▣ b.png"]);
+  expect(await cards(ui)).toHaveLength(1);
 });
 
 // Codex review, round 3, finding 3.
@@ -2421,4 +2545,26 @@ test("asks the dock for the width the pane was opened at, for as long as it is u
   close();
   await press("a.png", 120);
   expect(opened.at(-1)?.columns).toBe(54);
+});
+
+// Reported from a live terminal: the pane still showed a picture whose file
+// had been deleted, and blamed the converters.
+test("says the file is gone when the pane's picture was removed since it was opened", async ($, on) => {
+  const gone = new Set<string>();
+  world(on, { "shot.png": "image" }, {}, true, undefined, { gone });
+  await start($);
+  await img($, "shot.png");
+  const first = await pane($, 40, 21);
+  expect(await first.find({ type: "Raster" })).toBeDefined();
+  await first.unmount();
+
+  // The file is removed, and the pane drawn at another size.
+  gone.add("shot.png");
+  const ui = await pane($, 20, 11);
+  expect(
+    await ui.find({
+      type: "Text",
+      text: "shot.png · 200×100: the file is no longer there",
+    }),
+  ).toBeDefined();
 });

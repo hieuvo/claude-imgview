@@ -13,6 +13,7 @@ import {
   parseArgs,
   parseIdentifySize,
   parseSipsSize,
+  shortenPath,
   toBase64,
   toCells,
 } from "../hooks/picture";
@@ -143,6 +144,25 @@ describe("paths", () => {
     expect(expandHome("~other/a.png", "/home/me")).toBe("~other/a.png");
     expect(expandHome("a/~/b.png", "/home/me")).toBe("a/~/b.png");
     expect(expandHome("~/a.png", undefined)).toBe("~/a.png");
+  });
+
+  test("shortens a path for a label: the home directory as a tilde, and of a long path its end", () => {
+    expect(shortenPath("/home/me/shots/a.png", "/home/me", 40)).toBe(
+      "~/shots/a.png",
+    );
+    expect(shortenPath("/home/me/a.png", "/home/me/", 40)).toBe("~/a.png");
+    // A directory that only begins like the home directory is not it.
+    expect(shortenPath("/home/meow/a.png", "/home/me", 40)).toBe(
+      "/home/meow/a.png",
+    );
+    expect(shortenPath("/etc/a.png", undefined, 40)).toBe("/etc/a.png");
+    expect(shortenPath("/etc/a.png", "", 40)).toBe("/etc/a.png");
+    // Exactly as long as allowed: whole. One more: an ellipsis and the end.
+    expect(shortenPath("/abc/defg.png", undefined, 13)).toBe("/abc/defg.png");
+    expect(shortenPath("/abcd/defg.png", undefined, 13)).toBe("…bcd/defg.png");
+    expect(shortenPath("/home/me/abcdefgh/a.png", "/home/me", 10)).toBe(
+      "…fgh/a.png",
+    );
   });
 
   test("names a file by its last segment", () => {

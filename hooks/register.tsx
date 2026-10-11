@@ -14,6 +14,7 @@ import {
   parseArgs,
   parseIdentifySize,
   parseSipsSize,
+  shortenPath,
   toCells,
 } from "./picture";
 import type { Measured, Mode, Size } from "./picture";
@@ -27,6 +28,23 @@ const TEMP_PREFIX = "claude-imgview-";
 // A reply draws a chip for its first few image files; each chip's hover card
 // holds a picture of at most this many cells.
 const MAX_CHIPS = 4;
+// The chip of a file outside the working directory says where the file is,
+// in this many characters at most.
+const OUTSIDE_LABEL_MAX = 40;
+// The one thing of the mod the model reads: that a path it writes out is one
+// the person can open. Without it a model that made a picture has no reason
+// to say where.
+const HINT = {
+  id: "imgview:paths",
+  text:
+    "The imgview plugin is installed. The path of an image file written in " +
+    "your reply (png, jpg, jpeg, gif, webp, heic, bmp, tif, tiff) becomes a " +
+    "chip under the reply that the person hovers or clicks to preview the " +
+    "picture, and `/img <path>` opens one too. So when you create, change or " +
+    "refer to an image file, write its full path in the reply, bare or in a " +
+    "code span. A path with a space in it is not recognised.",
+  scope: "session",
+} as const;
 const CARD_COLUMNS = 80;
 const CARD_ROWS = 24;
 // The pixels a card's PNG is given a cell, where the terminal draws pixels.
@@ -86,8 +104,12 @@ type Frame = {
   error?: string;
 };
 
-/** A file a path leads to: where it landed and when it last changed. */
-type Located = { path: string; mtimeMs: number };
+/**
+ * A file a path leads to: where it landed and when it last changed. One
+ * outside the working directory gets a chip to click and no card: nothing of
+ * it is converted before the person asks.
+ */
+type Located = { path: string; mtimeMs: number; isOutside?: true };
 
 /**
  * A hover card's picture, measured and converted: cells, or on a terminal
@@ -281,7 +303,8 @@ async function locateMention(
   if (host.root === undefined) return undefined;
   const found = await host.stat(expandHome(given, host.home));
   if (found?.kind !== "file" || found.realPath === undefined) return undefined;
-  if (!isInside(found.realPath, host.root)) return undefined;
+  if (!isInside(found.realPath, host.root))
+    return { path: found.realPath, mtimeMs: found.mtimeMs, isOutside: true };
   if (found.size > PREVIEW_MAX_BYTES) return undefined;
 
   return { path: found.realPath, mtimeMs: found.mtimeMs };
@@ -497,6 +520,10 @@ export const register: Register = (on) => {
         } catch (error) {
           painted.error =
             error instanceof Error ? error.message : String(error);
+          // The pane outlives the file it shows: removed since, that is the
+          // reason to give, not the converters.
+          if ((await io.stat(job.picture.path))?.kind !== "file")
+            painted.error = "the file is no longer there";
         }
         if (wanted?.id !== job.id) continue;
         frame = painted;
@@ -834,6 +861,15 @@ export const register: Register = (on) => {
     return next(e);
   });
 
+  // On a terminal, where chips are drawn and `/img` answers, the system
+  // prompt ends with the hint. No other section is touched.
+  on("prompt.compose", async (_$, e, next) => {
+    const composed = await next(e);
+    if (!e.surfaces.includes("terminal")) return composed;
+
+    return { sections: [...composed.sections, HINT] };
+  });
+
   on("command.run", { command: "img" }, async ($, e) => {
     if (host === undefined)
       return { text: "img: not ready, the session has not started" };
@@ -1022,8 +1058,10 @@ export const register: Register = (on) => {
       if (failed.has(id)) continue;
       const slot = thumbs.get(id);
       // Only the drawing begun last of a reply still on screen asks for a
-      // card, holds one in use, or draws one.
+      // card, holds one in use, or draws one, and none does for a file
+      // outside the working directory.
       const isHolding =
+        file.isOutside !== true &&
         reply !== undefined &&
         reply.drawing === cards &&
         onScreen.get(e.requestId) === reply;
@@ -1038,7 +1076,10 @@ export const register: Register = (on) => {
 
       const index = chips.length;
       const name = baseName(file.path);
-      const label = `▣ ${name}`;
+      const label =
+        file.isOutside === true
+          ? `▣ ${shortenPath(file.path, io.home, OUTSIDE_LABEL_MAX)}`
+          : `▣ ${name}`;
       const width = card === undefined ? 16 : card.columns;
       const caption = (
         card === undefined
@@ -1058,13 +1099,23 @@ export const register: Register = (on) => {
               // A click is the person's: the pane takes the file itself, as
               // it is now and not as it was when the card was drawn.
               const found = await io.stat(file.path);
-              if (found?.kind !== "file") return;
+              if (found?.kind !== "file") {
+                $.ui.toast(`imgview: not a file any more: ${name}`);
+
+                return;
+              }
               const fresh = {
                 path: found.realPath ?? file.path,
                 mtimeMs: found.mtimeMs,
               };
               const size = await measure(io, fresh.path);
-              if (size === undefined) return;
+              if (size === undefined) {
+                $.ui.toast(
+                  `imgview: not an image sips or ImageMagick can read: ${name}`,
+                );
+
+                return;
+              }
               const mode = io.isPixelTerminal ? "pixels" : "cells";
               const picture = await oneAtATime(async () => {
                 const replacement = await present(
@@ -1079,7 +1130,11 @@ export const register: Register = (on) => {
 
                 return replacement;
               });
-              if (picture === undefined) return;
+              if (picture === undefined) {
+                $.ui.toast(`imgview: could not convert to PNG: ${name}`);
+
+                return;
+              }
               const isUp = (await $.ui.panes()).some(
                 (pane) => pane.id === PANE,
               );

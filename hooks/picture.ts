@@ -78,6 +78,26 @@ export function baseName(path: string): string {
   return path.replace(/\/+$/, "").split("/").pop() || path;
 }
 
+/**
+ * A path short enough to label a chip with: the home directory as `~`, and
+ * of a path longer than `max` characters only the end, behind an ellipsis.
+ */
+export function shortenPath(
+  path: string,
+  home: string | undefined,
+  max: number,
+): string {
+  const homeDir = home?.replace(/\/+$/, "") ?? "";
+  const shown =
+    homeDir !== "" && path.startsWith(`${homeDir}/`)
+      ? `~${path.slice(homeDir.length)}`
+      : path;
+
+  return shown.length <= max
+    ? shown
+    : `…${shown.slice(shown.length - (max - 1))}`;
+}
+
 // What a reply's mention is taken for a picture by: a bitmap's suffix. An SVG
 // or a PDF runs a renderer, which nothing here does unasked.
 const IMAGE_SUFFIX = /[^/]\.(?:png|jpe?g|gif|webp|heic|bmp|tiff?)$/i;

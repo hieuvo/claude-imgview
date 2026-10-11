@@ -2,10 +2,11 @@
 
 Preview images without leaving Claude Code, two ways:
 
-- **Hover.** Under any reply of Claude's that names an image file in the working
-  directory, the mod draws a chip per file (`▣ login.png`). Rest the pointer on a chip and a card with the
-  picture pops up over the rows above it; move away and it is gone. A click on the chip
-  opens the picture in the pane.
+- **Hover.** Under any reply of Claude's that names an image file, the mod draws a chip
+  per file (`▣ login.png`). For a file in the working directory, rest the pointer on the
+  chip and a card with the picture pops up over the rows above it; move away and it is
+  gone. A click on a chip opens the picture in the pane. A file elsewhere on the machine
+  gets a chip that says where it is (`▣ ~/Desktop/shot.png`) and no card: click it.
 - **`/img <path>`** opens a picture in a pane of the session: docked beside the
   transcript in the fullscreen layout from 110 columns, inline above the prompt otherwise.
 
@@ -48,7 +49,8 @@ and 100 columns, and keeps asking for that same width for as long as it is up
 click would give every picture another width. A width you drag the dock to wins.
 
 This plugin is a _mod_: a hooks module the engine loads (`hooks/hooks.json` names
-`register.tsx`), not a skill. It puts no skill text and no tool in the model's context.
+`register.tsx`), not a skill. It puts no skill and no tool in the model's context, and
+one short section at the end of the system prompt, quoted under "What it hooks and adds".
 The slash command is the person's; its one-line answer (`login.png · 1280×720 · cells`)
 is recorded in the transcript as any command's output is.
 
@@ -126,6 +128,16 @@ theirs: a hover card is made from a bitmap alone, by the format `sips` itself na
   chips under it. It does not change the reply's text, and nothing it draws is read by
   the model.
 - `ui.render` for its own pane (`Pane`, `imgview`): it draws the picture.
+- `prompt.compose`: on a terminal it adds one section, `imgview:paths`, after the last
+  of the system prompt, and changes no other. Without it a model that has just made a
+  picture has no reason to say where the file is. The whole of its text (`HINT`):
+
+  > The imgview plugin is installed. The path of an image file written in your reply
+  > (png, jpg, jpeg, gif, webp, heic, bmp, tif, tiff) becomes a chip under the reply that
+  > the person hovers or clicks to preview the picture, and `/img <path>` opens one too.
+  > So when you create, change or refer to an image file, write its full path in the
+  > reply, bare or in a code span. A path with a space in it is not recognised.
+
 - `classic.CwdChanged`: it reads the new working directory, to move the boundary of what
   a reply may preview, and passes the event on unchanged (`next(e)`).
 - `session.start` and `session.end`: it sets itself up and removes its temporary files,
@@ -142,6 +154,12 @@ to a word in it (`ui.render` on `AssistantMessage` wraps what `next(e)` drew).
   `.jpg`, `.jpeg`, `.gif`, `.webp`, `.heic`, `.bmp`, `.tif` or `.tiff`. A code span is
   taken as written; in prose the parentheses around a path are the sentence's. A web
   address gets none: nothing here fetches. A path with a space in it is not recognised.
+- A file outside the working directory gets a chip and no card. The chip's label is the
+  path, the home directory as `~` and of a long path the last 40 characters
+  (`shortenPath`), so you can see the file is elsewhere before you click. Nothing is run
+  for it until you do.
+- A click that opens nothing says why in a toast: the file is gone, it is no picture, or
+  it converts to no PNG.
 - The card holds at most 80 by 24 cells (`CARD_COLUMNS`, `CARD_ROWS`), fewer columns on
   a terminal narrower than 92. In `cells` mode that is a 160 by 48 pixel thumbnail.
 - The terminal applies a hover by itself and runs no hook for it, so the card cannot be
@@ -181,11 +199,17 @@ to a word in it (`ui.render` on `AssistantMessage` wraps what `next(e)` drew).
 ### What a reply can make the mod open
 
 A reply is the model's text, and a chip is drawn with no action of yours, so a hostile
-repository or an injected reply can name any path it likes. What that reaches is held
-to less than what `/img` takes (`locateMention`, `preview` and `sketch` in
-`hooks/register.tsx`):
+repository or an injected reply can name any path it likes. What that reaches with no
+click is held to less than what `/img` takes (`locateMention`, `preview` and `sketch` in
+`hooks/register.tsx`).
 
-| A mention gets a chip only when                                 | Enforced by                                                                     |
+A mention that leads to a regular file outside the session's working directory gets a
+chip and nothing else: the mod has asked the file system what the path leads to and has
+run no program (`isOutside` in `locateMention`; such a file is never given a card,
+`file.isOutside !== true` in the `ui.render` hook). Inside the working directory a
+mention gets a chip only together with its card:
+
+| A mention gets a hover card only when                           | Enforced by                                                                     |
 | --------------------------------------------------------------- | ------------------------------------------------------------------------------- |
 | it lands inside the session's working directory, links followed | `isInside(found.realPath, host.root)`; `host.root` follows `classic.CwdChanged` |
 | the file is at most 20 MiB                                      | `PREVIEW_MAX_BYTES`, on the file before anything runs and again on the copy     |
@@ -257,7 +281,10 @@ This stops protecting at three edges:
 
 3. `/img <path>` has none of these limits: a path you type is opened wherever it is,
    SVG and PDF included, with ImageMagick as the fallback. So is a chip you click: the
-   pane then takes the file itself, measured again as it is at the click.
+   pane then takes the file itself, measured again as it is at the click. For the chip
+   of a file outside the working directory that click is the first look at the file: no
+   check has said it is a picture, and the chip's label is all that tells you where it
+   is.
 
 ## How it draws
 
