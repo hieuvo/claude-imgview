@@ -9,12 +9,14 @@ import {
   findImagePaths,
   fit,
   fromBase64,
+  hasImageSuffix,
   isBitmapFormat,
   isInside,
   parseArgs,
   parseIdentifySize,
   parseSipsSize,
   shortenPath,
+  tempDir,
   toCells,
 } from "./picture";
 import type { Measured, Mode, Size } from "./picture";
@@ -59,9 +61,10 @@ const MAX_LOCATED = 128;
 // that could not be drawn is remembered apart.
 const MAX_THUMBS = 32;
 const MAX_FAILED = 128;
-// The replies remembered as on screen. The engine says when one scrolls off
-// it, and nothing of one taken out of the transcript: such a reply holds its
-// cards until this many others have been drawn after it.
+// The replies remembered as on screen: those that asked for a card. The
+// engine says when one scrolls off it, and nothing of one taken out of the
+// transcript: such a reply holds its cards until this many others have been
+// drawn after it.
 const MAX_ON_SCREEN = 64;
 // What a reply names is converted with no action of the person's, so it is
 // held to less than what `/img` takes: a file this small, a picture of this
@@ -89,6 +92,8 @@ const shown = atom({ plugin: "imgview", key: "shown" } as const, null);
 // Every temporary file the mod has made and not yet removed, by its path:
 // kept with the session, so a module loaded again knows what the last left.
 const temps = atom({ plugin: "imgview", key: "temps" } as const, []);
+/** The engine as a hook is handed it, which the session's state is read by. */
+type Engine = Parameters<typeof read>[0];
 // How far behind the files that record is written: a drawing may write no
 // state, so the record is never written from where a file is made.
 const RECORD_DELAY_MS = 100;
@@ -292,9 +297,11 @@ async function rasterize(
 }
 
 /**
- * The file a reply's mention leads to, a `~` expanded: a regular file that
- * lands inside the session's working directory, every link followed, and is
- * no larger than a preview takes. Undefined for anything else.
+ * The file a reply's mention leads to, a `~` expanded and every link
+ * followed: a regular file named as a bitmap is where it lands, as the
+ * mention was where it was written. One outside the session's working
+ * directory is marked so, whatever its size; one inside is no larger than a
+ * preview takes. Undefined for anything else.
  */
 async function locateMention(
   host: Host,
@@ -303,6 +310,8 @@ async function locateMention(
   if (host.root === undefined) return undefined;
   const found = await host.stat(expandHome(given, host.home));
   if (found?.kind !== "file" || found.realPath === undefined) return undefined;
+  // A link named like a picture is taken by the name of what it leads to.
+  if (!hasImageSuffix(found.realPath)) return undefined;
   if (!isInside(found.realPath, host.root))
     return { path: found.realPath, mtimeMs: found.mtimeMs, isOutside: true };
   if (found.size > PREVIEW_MAX_BYTES) return undefined;
@@ -386,14 +395,13 @@ function isReadablePng(path: string, format: string | undefined): boolean {
 }
 
 /**
- * The picture the pane will show in place of `previous`, or undefined when
- * `pixels` mode needs a PNG and nothing converts the file to one. The PNG the
- * mod converted for `previous` goes: it is the mod's to remove, where a PNG
- * the pane was shown as it is never is.
+ * The picture the pane is to show next, or undefined when `pixels` mode needs
+ * a PNG and nothing converts the file to one. Nothing is removed here: the
+ * PNG made for the picture on show goes once the pane has taken this one
+ * (`replace`).
  */
 async function present(
   host: Host,
-  previous: Shown | null,
   file: Located,
   size: Measured,
   mode: Mode,
@@ -417,6 +425,35 @@ async function present(
       picture.png = out;
       picture.isPngTemporary = true;
     }
+  }
+
+  return picture;
+}
+
+/**
+ * Puts a picture in the pane in place of the one there; undefined when it
+ * converts to no PNG. The PNG the mod made for the picture replaced goes once
+ * the pane has taken the next, and not before. Where the pane does not take
+ * it the call fails, the PNG made for the next goes instead, and the picture
+ * on show stays as it is. A PNG the pane was shown as it is is the person's,
+ * and never removed. One call at a time: each sees the picture it replaces.
+ */
+async function replace(
+  $: Engine,
+  host: Host,
+  file: Located,
+  size: Measured,
+  mode: Mode,
+): Promise<Shown | undefined> {
+  const previous = await read($, shown);
+  const picture = await present(host, file, size, mode);
+  if (picture === undefined) return undefined;
+  try {
+    await update($, shown, () => picture);
+  } catch (error) {
+    if (picture.isPngTemporary === true && picture.png !== undefined)
+      host.remove(picture.png);
+    throw error;
   }
   if (
     previous?.png !== undefined &&
@@ -483,6 +520,12 @@ export const register: Register = (on) => {
   // long as the pane is up. A docked pane narrows the conversation, so a share
   // of the conversation's width taken anew at every open never comes to rest.
   let dockColumns: number | undefined;
+  // Counts the sweeps: one that ran across the pane's conversion took its
+  // bitmap from under it.
+  let sweeps = 0;
+  // A mention on screen was left without a chip for want of room among the
+  // cards: once room is made, the replies are drawn again.
+  let isStarved = false;
 
   /** What the pane asks of the layout for a picture, up already or not. */
   function sized(picture: Shown, columns: number, isUp: boolean) {
@@ -512,12 +555,15 @@ export const register: Register = (on) => {
         const job = wanted;
         if (job === undefined || frame?.id === job.id) return;
         let painted: Frame = { id: job.id, ...job.box };
+        const swept = sweeps;
         try {
           painted = {
             id: job.id,
             ...(await rasterize(io, job.picture.path, job.box)),
           };
         } catch (error) {
+          // A sweep removed the bitmap before it was read: converted again.
+          if (swept !== sweeps) continue;
           painted.error =
             error instanceof Error ? error.message : String(error);
           // The pane outlives the file it shows: removed since, that is the
@@ -550,22 +596,46 @@ export const register: Register = (on) => {
     onScreen.clear();
   }
 
+  /**
+   * Room was made among the cards. Where a mention was left without a chip
+   * for want of it, the replies are drawn again: after the drawing this is
+   * called from, since the engine draws a reply that sits still no other way.
+   */
+  function freed() {
+    if (!isStarved || host === undefined) return;
+    isStarved = false;
+    const io = host;
+    io.after(0, () => io.redraw());
+  }
+
   /** Notes a reply as on screen, the one drawn last of them. */
   function enter(requestId: string): Reply {
     const reply = onScreen.get(requestId) ?? { cards: new Set() };
     onScreen.delete(requestId);
     onScreen.set(requestId, reply);
-    for (const stale of onScreen.keys()) {
-      if (onScreen.size <= MAX_ON_SCREEN) break;
-      onScreen.delete(stale);
-    }
 
     return reply;
   }
 
+  /**
+   * Holds the record to `MAX_ON_SCREEN` replies: past that the one drawn
+   * longest ago goes, and its cards are in use no more.
+   */
+  function trim() {
+    for (const [stale, reply] of onScreen) {
+      if (onScreen.size <= MAX_ON_SCREEN) break;
+      onScreen.delete(stale);
+      if (reply.cards.size > 0) freed();
+    }
+  }
+
   /** Notes a reply as on screen no longer: its cards are in use no more. */
   function leave(requestId: string) {
-    if (onScreen.delete(requestId)) pruneQueue();
+    const reply = onScreen.get(requestId);
+    if (reply === undefined) return;
+    onScreen.delete(requestId);
+    pruneQueue();
+    if (reply.cards.size > 0 || (reply.drawing?.size ?? 0) > 0) freed();
   }
 
   /** Whether a reply on screen draws this card, or is being drawn with it. */
@@ -657,7 +727,12 @@ export const register: Register = (on) => {
       });
       const settle = (card: Card | undefined) => {
         deadline.cancel();
-        if (isLate) abandoned--;
+        if (isLate) {
+          abandoned--;
+          // Cards are begun again from here: the mentions left without a
+          // chip meanwhile get theirs with this drawing.
+          if (abandoned === MAX_ABANDONED - 1) io.redraw();
+        }
         // Too late to be a card: its PNG went as it was kept.
         resolve(isLate ? undefined : card);
       };
@@ -724,7 +799,7 @@ export const register: Register = (on) => {
   }
 
   on("session.start", async ($, e, next) => {
-    const dir = ((await $.env.get("TMPDIR")) ?? "/tmp").replace(/\/+$/, "");
+    const dir = tempDir(await $.env.get("TMPDIR"));
     let root: string | undefined;
     try {
       root = (await $.fs.stat(e.cwd, { resolve: true })).realPath;
@@ -785,6 +860,7 @@ export const register: Register = (on) => {
         });
       },
       sweep: async () => {
+        sweeps++;
         const pane = await read($, shown);
         const kept = pane?.isPngTemporary === true ? pane.png : undefined;
         const left = [...owned].filter((path) => path !== kept);
@@ -905,18 +981,12 @@ export const register: Register = (on) => {
       };
 
     const mode = request.mode ?? (io.isPixelTerminal ? "pixels" : "cells");
-    const picture = await oneAtATime(async () => {
-      const replacement = await present(
-        io,
-        await read($, shown),
-        file,
-        size,
-        mode,
-      );
-      if (replacement !== undefined) await update($, shown, () => replacement);
-
-      return replacement;
-    });
+    let picture: Shown | undefined;
+    try {
+      picture = await oneAtATime(() => replace($, io, file, size, mode));
+    } catch {
+      return { text: `img: could not show ${target}, try again` };
+    }
     if (picture === undefined)
       return { text: `img: could not convert to PNG: ${target}` };
     const isUp = (await $.ui.panes()).some((pane) => pane.id === PANE);
@@ -1028,10 +1098,14 @@ export const register: Register = (on) => {
     const maxColumns = Math.max(16, Math.min(CARD_COLUMNS, columns - 12));
     const chips = [];
     let offset = 0;
+    // Whether an inside file of this reply's asks for a card, got or not.
+    let isAsking = false;
+    const drawnUnder = boundary;
     for (const mention of mentions) {
-      // Between two working directories nothing is looked up, or remembered.
-      if (io.root === undefined) break;
       const now = await $.clock.now();
+      // Between two working directories nothing is looked up, or remembered:
+      // asked once the clock has answered, behind which a change may have come.
+      if (io.root === undefined) break;
       let entry = located.get(mention);
       if (entry === undefined || now - entry.at > LOCATE_TTL_MS) {
         const asked = boundary;
@@ -1065,9 +1139,13 @@ export const register: Register = (on) => {
         reply !== undefined &&
         reply.drawing === cards &&
         onScreen.get(e.requestId) === reply;
+      if (file.isOutside !== true) isAsking = true;
       if (isHolding) {
         // No room among the cards on screen: this one waits, with no chip.
-        if (slot === undefined && !admitThumb(io)) continue;
+        if (slot === undefined && !admitThumb(io)) {
+          isStarved = true;
+          continue;
+        }
         cards.add(id);
         if (slot !== undefined) slot.askedAt = ++asked;
         else sketch(io, file, id, maxColumns);
@@ -1117,19 +1195,16 @@ export const register: Register = (on) => {
                 return;
               }
               const mode = io.isPixelTerminal ? "pixels" : "cells";
-              const picture = await oneAtATime(async () => {
-                const replacement = await present(
-                  io,
-                  await read($, shown),
-                  fresh,
-                  size,
-                  mode,
+              let picture: Shown | undefined;
+              try {
+                picture = await oneAtATime(() =>
+                  replace($, io, fresh, size, mode),
                 );
-                if (replacement !== undefined)
-                  await update($, shown, () => replacement);
+              } catch {
+                $.ui.toast(`imgview: could not show ${name}, try again`);
 
-                return replacement;
-              });
+                return;
+              }
               if (picture === undefined) {
                 $.ui.toast(`imgview: could not convert to PNG: ${name}`);
 
@@ -1178,8 +1253,23 @@ export const register: Register = (on) => {
     // The drawing of a reply begun last says which cards the reply draws now.
     if (reply !== undefined && reply.drawing === cards) {
       reply.drawing = undefined;
+      // A card it drew before and draws no longer is in use no more.
+      const isLetGo = [...reply.cards].some((id) => !cards.has(id));
       reply.cards = cards;
+      if (onScreen.get(e.requestId) === reply) {
+        // A reply that asked for no card (its files are missing, refused or
+        // outside) takes no place among those that did.
+        if (isAsking) trim();
+        else onScreen.delete(e.requestId);
+        if (isLetGo) {
+          pruneQueue();
+          freed();
+        }
+      }
     }
+    // The working directory changed while this was drawn: what it found is
+    // the old one's, and the drawing that change asked for draws the new.
+    if (drawnUnder !== boundary) return row;
     if (chips.length === 0) return row;
 
     return (

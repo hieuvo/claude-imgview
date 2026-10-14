@@ -103,6 +103,8 @@ function world(
     readGate?: Promise<void>;
     // When each of these files last changed, read at every look.
     mtimes?: Record<string, number>;
+    // Links: where each of these names really lands.
+    targets?: Record<string, string>;
   } = {},
 ) {
   // The engine's clock, moved by the test alone.
@@ -127,17 +129,20 @@ function world(
   let running = 0;
   let peak = 0;
   const realOf = (name: string) =>
-    files[name] === "link-out"
+    extra.targets?.[name] ??
+    (files[name] === "link-out"
       ? `/elsewhere/${name.split("/").pop()}`
       : name.startsWith("/")
         ? name
-        : `/work/${name}`;
+        : `/work/${name}`);
   /** The file a path is, itself or as a copy; undefined for any other path. */
   const nameAt = (path: string) =>
     copies.get(path) ??
     Object.keys(files).find((name) => realOf(name) === path);
   const sizeOf = (name: string) =>
     files[name] === "heavy" ? 100 * 1024 * 1024 : 10;
+  // Every path `rm` removed: nothing reads one afterwards.
+  const removed = new Set<string>();
   // How often each file was looked at: a `moved` one changes after the first.
   const looks = new Map<string, number>();
 
@@ -204,7 +209,7 @@ function world(
           kind === "piped" && seen > 0 ? ("other" as const) : ("file" as const),
         size: sizeOf(name),
         mtimeMs: extra.mtimes?.[name] ?? (kind === "moved" && seen > 0 ? 8 : 7),
-        isLink: kind === "link-out",
+        isLink: kind === "link-out" || extra.targets?.[name] !== undefined,
         realPath: realOf(name),
       },
     };
@@ -250,7 +255,10 @@ function world(
     }
     if (tool === "rm") {
       if (extra.rm?.isFailing === true) return done("", 1);
-      for (const path of e.argv.slice(1)) copies.delete(path);
+      for (const path of e.argv.slice(1)) {
+        copies.delete(path);
+        removed.add(path);
+      }
 
       return done();
     }
@@ -314,6 +322,7 @@ function world(
   on("command.register", (_$, e) => ({ value: { command: e.name } }));
   on("fs.read", async (_$, e) => {
     await extra.readGate;
+    if (removed.has(e.path)) return { deny: "no such file" };
 
     return { value: { base64: written.get(e.path) ?? "" } };
   });
@@ -898,7 +907,7 @@ test("opens a file outside the working directory when its chip is clicked, havin
   expect(runs.map((argv) => argv.at(-1))).toEqual(["/photos/cat.jpg"]);
 });
 
-test("labels the chip of a file outside the working directory with the end of a long path", async ($, on) => {
+test("labels the chip of a file outside the working directory with both ends of a long path", async ($, on) => {
   const path =
     "/var/folders/aa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/T/screens/shot.png";
   world(on, { [path]: "image" });
@@ -906,8 +915,10 @@ test("labels the chip of a file outside the working directory with the end of a 
 
   const ui = await reply($, `Saved to ${path}.`);
   const label = String((await ui.find({ type: "Button" }))?.props.label);
-  // The mark, an ellipsis and the last 39 characters: 40 for the path.
-  expect(label).toBe(`▣ …${path.slice(-39)}`);
+  // The mark, then 40 characters for the path: its first 13, an ellipsis and
+  // its last 26.
+  expect(label).toBe(`▣ ${path.slice(0, 13)}…${path.slice(-26)}`);
+  expect(label.startsWith("▣ /var/folders/")).toBe(true);
   expect(label.endsWith("/T/screens/shot.png")).toBe(true);
 });
 
@@ -2567,4 +2578,352 @@ test("says the file is gone when the pane's picture was removed since it was ope
       text: "shot.png · 200×100: the file is no longer there",
     }),
   ).toBeDefined();
+});
+
+// Antigravity review, finding 1: the picture on show is given up only once
+// the pane has taken the next.
+test("keeps the PNG the pane shows, and removes the one it made, when the pane will not take the next picture", async ($, on) => {
+  const refusing = { isOn: false };
+  on("state.set", (_$, e, next) =>
+    refusing.isOn && e.key === "shown"
+      ? { deny: "refused while a reply is drawn" }
+      : next(e),
+  );
+  const { runs, toasts, opened } = world(
+    on,
+    { "/photos/cat.jpg": "image", "/photos/dog.jpg": "image" },
+    { TERM: "xterm-kitty" },
+  );
+  await start($);
+  await img($, "/photos/cat.jpg");
+  const converted = () =>
+    runs.filter((argv) => argv[1] === "-s").map((argv) => argv.at(-1)!);
+  const removed = () =>
+    runs.filter((argv) => argv[0] === "rm").flatMap((argv) => argv.slice(2));
+  const [first] = converted();
+
+  const ui = await reply($, "See /photos/dog.jpg.");
+  refusing.isOn = true;
+  await ui.press({ key: "imgview-open-0" });
+  const second = converted()[1]!;
+  expect(second).not.toBe(first);
+  // The PNG made for the picture not shown goes; the one on show stays.
+  expect(removed()).toEqual([second]);
+  expect(toasts).toEqual(["imgview: could not show dog.jpg, try again"]);
+  expect(opened).toHaveLength(1);
+
+  // `/img` says the same, and removes what it made too.
+  const answer = await img($, "/photos/dog.jpg");
+  expect(answer.text).toBe("img: could not show /photos/dog.jpg, try again");
+  expect(removed()).toEqual([second, converted()[2]!]);
+  const still = await pane($, 40, 21);
+  expect((await still.find({ type: "Image" }))?.props.source).toMatchObject({
+    file: first,
+  });
+
+  // Taken again, the next picture replaces the first, whose PNG goes then.
+  refusing.isOn = false;
+  await img($, "/photos/dog.jpg");
+  expect(removed()).toEqual([second, converted()[2]!, first]);
+});
+
+// Antigravity review, finding 2: a link is taken by the name of the file it
+// leads to, as a path is by its own.
+test("draws no chip, and runs nothing, for a link named like a picture that leads to a file not named like one", async ($, on) => {
+  const { runs } = world(
+    on,
+    { "shot.png": "pdf", "key.png": "text", "pic.png": "image" },
+    {},
+    true,
+    undefined,
+    {
+      targets: {
+        "shot.png": "/work/payload.pdf",
+        "key.png": "/home/me/.ssh/id_rsa",
+        "pic.png": "/work/assets/real.jpg",
+      },
+    },
+  );
+  await start($);
+
+  const ui = await reply($, "See shot.png, key.png and pic.png.");
+  expect(
+    (await ui.findAll({ type: "Button" })).map((chip) => chip.props.label),
+  ).toEqual(["▣ real.jpg"]);
+  // Neither the PDF inside nor the key outside was handed to any program.
+  const named = runs.flat().join(" ");
+  expect(named).not.toContain("payload.pdf");
+  expect(named).not.toContain("id_rsa");
+  expect(runs.some((argv) => argv.includes("/work/assets/real.jpg"))).toBe(
+    true,
+  );
+});
+
+/** A gate on the engine's clock: the `nth` reading of it waits here. */
+function clockGate(on: On, nth: number) {
+  let open = () => {};
+  const gate = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  let readings = 0;
+  // A second hook on the clock, above the one `mock.clock` answers with.
+  on("clock.now", {}, async (_$, e, next) => {
+    if (++readings === nth) await gate;
+
+    return next(e);
+  });
+
+  return {
+    open,
+    /** Starts counting anew: the `nth` reading from here waits. */
+    arm: () => {
+      readings = 0;
+    },
+  };
+}
+
+// Antigravity review, finding 4: a drawing the change of directory came in
+// behind remembers nothing.
+test("remembers no lookup made while the working directory was changing", async ($, on) => {
+  let resolveDir = () => {};
+  const dirGate = new Promise<void>((resolve) => {
+    resolveDir = resolve;
+  });
+  const now = clockGate(on, 1);
+  const { clock } = world(
+    on,
+    { sub: "dir", "sub/a.png": "image" },
+    {},
+    true,
+    undefined,
+    { statGate: { path: "/work/sub", gate: dirGate } },
+  );
+  on("classic.CwdChanged", () => ({}));
+  await start($);
+
+  // The drawing has read no clock yet when the directory begins to change.
+  now.arm();
+  const drawing = reply($, "/work/sub/a.png");
+  await clock.settle();
+  const changing = $.classic.CwdChanged({
+    old_cwd: "/work",
+    new_cwd: "/work/sub",
+  });
+  await clock.settle();
+  now.open();
+  const during = await drawing;
+  expect(await during.findAll({ type: "Button" })).toHaveLength(0);
+  await during.unmount();
+
+  // The new directory is known at once after: the file is found in it, not
+  // remembered as missing.
+  resolveDir();
+  await changing;
+  const after = await reply($, "/work/sub/a.png");
+  expect(await after.findAll({ type: "Raster" })).toHaveLength(1);
+});
+
+// Antigravity review, finding 5: a mention left without a chip gets one when
+// there is room, with no need for its reply to be scrolled.
+test(
+  "draws the replies again when a card's place comes free for a mention that had none",
+  { timeoutMs: 20000 },
+  async ($, on) => {
+    const files: Record<string, Kind> = { "extra.png": "image" };
+    const replies: string[] = [];
+    for (let n = 0; n < 8; n++) {
+      const names = [0, 1, 2, 3].map((k) => `p${n}-${k}.png`);
+      for (const name of names) files[name] = "image";
+      replies.push(names.join(" "));
+    }
+    const { clock } = world(on, files);
+    await start($);
+    for (const [n, text] of replies.entries()) {
+      const ui = await reply($, text, { id: `reply-${n}` });
+      await ui.unmount();
+    }
+    // All 32 in use: the 33rd picture gets no chip, and its reply sits still.
+    const waiting = await reply($, "extra.png", { id: "extra" });
+    expect(await waiting.findAll({ type: "Button" })).toHaveLength(0);
+
+    // Another reply scrolls away. Nobody draws the waiting one but the mod.
+    const gone = await reply($, replies[0]!, {
+      id: "reply-0",
+      isOffScreen: true,
+    });
+    await gone.unmount();
+    await clock.advance(0);
+    await clock.settle();
+    expect(await waiting.findAll({ type: "Button" })).toHaveLength(1);
+  },
+);
+
+test(
+  "draws the replies again when a reply on screen lets a card go, or is taken to be gone",
+  { timeoutMs: 30000 },
+  async ($, on) => {
+    const files: Record<string, Kind> = {
+      "extra.png": "image",
+      "more.png": "image",
+    };
+    const replies: string[] = [];
+    for (let n = 0; n < 8; n++) {
+      const names = [0, 1, 2, 3].map((k) => `p${n}-${k}.png`);
+      for (const name of names) files[name] = "image";
+      replies.push(names.join(" "));
+    }
+    for (let n = 0; n < 54; n++) files[`junk${n}.png`] = "text";
+    const { clock } = world(on, files);
+    await start($);
+    const draw = async (text: string, id: string) => {
+      const ui = await reply($, text, { id });
+      await ui.unmount();
+    };
+    for (const [n, text] of replies.entries()) await draw(text, `reply-${n}`);
+    const waiting = await reply($, "extra.png", { id: "extra" });
+    expect(await waiting.findAll({ type: "Button" })).toHaveLength(0);
+
+    // The first reply is drawn again, on screen still, with one picture of
+    // its four: three cards are let go.
+    await draw("p0-0.png", "reply-0");
+    await clock.settle();
+    expect(await waiting.findAll({ type: "Button" })).toHaveLength(1);
+    await waiting.unmount();
+
+    // Full again, and this time nobody says a reply left. The record holds
+    // eleven replies: 53 more that ask for a card fill it to 64, with no
+    // room made.
+    await draw("p0-1.png p0-2.png", "refill");
+    const second = await reply($, "more.png", { id: "more" });
+    expect(await second.findAll({ type: "Button" })).toHaveLength(0);
+    for (let n = 0; n < 53; n++) await draw(`junk${n}.png`, `junk-${n}`);
+    await clock.settle();
+    expect(await second.findAll({ type: "Button" })).toHaveLength(0);
+    // The 65th pushes the one drawn longest ago off it: that reply's cards
+    // are in use no more, and no drawing follows but the one the mod asks for.
+    await draw("junk53.png", "junk-53");
+    await clock.settle();
+    expect(await second.findAll({ type: "Button" })).toHaveLength(1);
+  },
+);
+
+test(
+  "draws the replies again when a preview given up answers, and cards are begun once more",
+  { timeoutMs: 30000 },
+  async ($, on) => {
+    let open = () => {};
+    const readGate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    const files: Record<string, Kind> = {};
+    for (let n = 0; n < 10; n++) files[`h${n}.png`] = "image";
+    const { runs, clock } = world(on, files, {}, true, undefined, { readGate });
+    await start($);
+
+    for (let n = 0; n < 9; n++) await reply($, `h${n}.png`, { id: `r${n}` });
+    for (let n = 0; n < 8; n++) await clock.advance(30000);
+    const late = await reply($, "h9.png", { id: "r9" });
+    expect(await late.findAll({ type: "Button" })).toHaveLength(0);
+    expect(runs.filter(isCopy)).toHaveLength(8);
+
+    // The eight answer. No reply is drawn by the test: the mod asks for it.
+    open();
+    await clock.settle();
+    expect(await late.findAll({ type: "Button" })).toHaveLength(1);
+    expect(
+      runs
+        .filter(isCopy)
+        .slice(8)
+        .map((argv) => argv[4]),
+    ).toContain("/work/h9.png");
+  },
+);
+
+// Antigravity review, finding 6.
+test(
+  "gives no place among the replies on screen to one that asked for no card",
+  { timeoutMs: 30000 },
+  async ($, on) => {
+    const files: Record<string, Kind> = {
+      "extra.png": "image",
+      "/out/far.png": "image",
+    };
+    const replies: string[] = [];
+    for (let n = 0; n < 8; n++) {
+      const names = [0, 1, 2, 3].map((k) => `p${n}-${k}.png`);
+      for (const name of names) files[name] = "image";
+      replies.push(names.join(" "));
+    }
+    world(on, files);
+    await start($);
+    const rasters = async (text: string, id: string) => {
+      const ui = await reply($, text, { id });
+      const count = (await ui.findAll({ type: "Raster" })).length;
+      await ui.unmount();
+
+      return count;
+    };
+    for (const [n, text] of replies.entries())
+      expect(await rasters(text, `reply-${n}`)).toBe(4);
+
+    // 64 replies that name a file that is not there, and 64 that name one
+    // outside: none asks for a card, so none pushes a reply that holds one
+    // off the record.
+    for (let n = 0; n < 128; n++)
+      await rasters(n % 2 ? `nope${n}.png` : "/out/far.png", `idle-${n}`);
+    expect(await rasters("extra.png", "extra")).toBe(0);
+    expect(await rasters("extra.png", "extra")).toBe(0);
+  },
+);
+
+// Antigravity review, finding 7.
+for (const TMPDIR of ["", "-rf", "relative/dir"]) {
+  test(`puts its files under /tmp when TMPDIR is ${JSON.stringify(TMPDIR)}, no absolute path`, async ($, on) => {
+    const { runs } = world(on, { "shot.png": "image" }, { TMPDIR });
+    await start($);
+
+    const ui = await reply($, "Saved shot.png.");
+    expect(await ui.findAll({ type: "Raster" })).toHaveLength(1);
+    const copy = runs.find(isCopy)![5]!;
+    expect(copy).toMatch(/^\/tmp\/claude-imgview-[0-9a-f-]{36}\.snap$/);
+    // No program is handed a name it could read as an option.
+    for (const argv of runs)
+      for (const word of argv.slice(1))
+        if (word.includes("claude-imgview-")) expect(word[0]).toBe("/");
+  });
+}
+
+// Antigravity review, finding 10: a session's end sweeps the bitmap the
+// pane's conversion has written and not yet read.
+test("converts the pane's picture again when the session's end took the bitmap from under it", async ($, on) => {
+  let open = () => {};
+  const readGate = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  const { runs, clock } = world(
+    on,
+    { "shot.png": "image" },
+    {},
+    true,
+    undefined,
+    {
+      readGate,
+    },
+  );
+  await start($);
+  await img($, "shot.png");
+  const ui = await pane($, 40, 21);
+  await clock.settle();
+  expect(runs.filter((argv) => argv[1] === "-s")).toHaveLength(1);
+
+  await $.session.end({
+    reason: "clear",
+    sessionId: "s-1",
+    resume: { id: "s-1" },
+  });
+  open();
+  await clock.settle();
+  expect(runs.filter((argv) => argv[1] === "-s")).toHaveLength(2);
+  expect(await ui.find({ type: "Raster" })).toBeDefined();
+  expect(await ui.find({ type: "Text", text: /: / })).toBeUndefined();
 });

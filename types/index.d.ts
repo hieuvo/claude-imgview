@@ -8,7 +8,11 @@ export type Shown = {
   width: number;
   /** Pixels down. */
   height: number;
-  /** Last modification, milliseconds since the epoch: a change redraws. */
+  /**
+   * Last modification as the `/img` or the click that showed the picture
+   * found it, milliseconds since the epoch. The pane does not watch the file:
+   * a later change is drawn at the next `/img` or click.
+   */
   mtimeMs: number;
   /** `pixels`: the terminal draws the file itself; `cells`: quarter blocks. */
   mode: "cells" | "pixels";

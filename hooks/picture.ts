@@ -65,12 +65,31 @@ export function parseArgs(args: string): Request {
   return mode ? { path, mode } : { path };
 }
 
-/** `~` and `~/x` under `home`; any other path as given. */
+/**
+ * `~` and `~/x` under `home`; any other path as given, and every path where
+ * `home` is no absolute path: an empty one would turn `~/x` into `/x`.
+ */
 export function expandHome(path: string, home: string | undefined): string {
-  if (home === undefined || (path !== "~" && !path.startsWith("~/")))
+  if (
+    home === undefined ||
+    !home.startsWith("/") ||
+    (path !== "~" && !path.startsWith("~/"))
+  )
     return path;
 
-  return home.replace(/\/+$/, "") + path.slice(1);
+  // `/` is the one home that is nothing once its slashes are taken off.
+  return home.replace(/\/+$/, "") + path.slice(1) || "/";
+}
+
+/**
+ * Where the mod's temporary files go: `tmpdir` when it is an absolute path,
+ * `/tmp` when it is unset, empty or relative. No slash at the end, so a name
+ * under it is `${dir}/name`, begins with a slash, and is no program's option.
+ */
+export function tempDir(tmpdir: string | undefined): string {
+  const dir = tmpdir?.startsWith("/") === true ? tmpdir : "/tmp";
+
+  return dir.replace(/\/+$/, "");
 }
 
 /** The last path segment. */
@@ -80,7 +99,9 @@ export function baseName(path: string): string {
 
 /**
  * A path short enough to label a chip with: the home directory as `~`, and
- * of a path longer than `max` characters only the end, behind an ellipsis.
+ * of a path longer than `max` characters both ends around an ellipsis, `max`
+ * characters in all. The start says whose directory it is, the end which
+ * file: a third of the room goes to the start.
  */
 export function shortenPath(
   path: string,
@@ -93,15 +114,63 @@ export function shortenPath(
       ? `~${path.slice(homeDir.length)}`
       : path;
 
-  return shown.length <= max
-    ? shown
-    : `…${shown.slice(shown.length - (max - 1))}`;
+  if (shown.length <= max) return shown;
+  const head = Math.floor((max - 1) / 3);
+
+  return `${shown.slice(0, head)}…${shown.slice(shown.length - (max - 1 - head))}`;
 }
 
-// What a reply's mention is taken for a picture by: a bitmap's suffix. An SVG
-// or a PDF runs a renderer, which nothing here does unasked.
+// What a reply's mention is taken for a picture by: a bitmap's suffix, on the
+// path as written and on the file it leads to. The suffix is a first sieve
+// and no proof: `sips` is then asked what a copy of the file really is, and a
+// PDF under a bitmap's name is read that far before it is refused.
 const IMAGE_SUFFIX = /[^/]\.(?:png|jpe?g|gif|webp|heic|bmp|tiff?)$/i;
 const BITMAP_FORMATS = ["png", "jpeg", "gif", "tiff", "bmp", "heic", "webp"];
+
+/** Whether a path ends as a bitmap's file name does. */
+export function hasImageSuffix(path: string): boolean {
+  return IMAGE_SUFFIX.test(path);
+}
+
+/**
+ * Where the code span that a run of `length` backticks opens is closed: at
+ * the next run of as many, on the same line. -1 when there is none, and then
+ * the backticks are the prose's.
+ */
+function closeOfSpan(text: string, from: number, length: number): number {
+  const runs = /`+/g;
+  runs.lastIndex = from;
+  for (let run = runs.exec(text); run !== null; run = runs.exec(text)) {
+    if (text.slice(from, run.index).includes("\n")) return -1;
+    if (run[0].length === length) return run.index;
+  }
+
+  return -1;
+}
+
+/**
+ * A text as markdown reads it: the code spans, each opened by one or two
+ * backticks and closed by as many, and the prose around them. Three backticks
+ * or more fence a block, whose lines are read as prose.
+ */
+function segments(text: string): { text: string; isCode: boolean }[] {
+  const parts: { text: string; isCode: boolean }[] = [];
+  const ticks = /`+/g;
+  let prose = 0;
+  for (let open = ticks.exec(text); open !== null; open = ticks.exec(text)) {
+    const length = open[0].length;
+    const start = open.index + length;
+    const close = length > 2 ? -1 : closeOfSpan(text, start, length);
+    if (close < 0) continue;
+    parts.push({ text: text.slice(prose, open.index), isCode: false });
+    parts.push({ text: text.slice(start, close), isCode: true });
+    prose = close + length;
+    ticks.lastIndex = prose;
+  }
+  parts.push({ text: text.slice(prose), isCode: false });
+
+  return parts;
+}
 
 /**
  * The image files a text mentions, in order, each once, `limit` at most: every
@@ -117,16 +186,16 @@ export function findImagePaths(text: string, limit: number): string[] {
   const found: string[] = [];
   const take = (run: string) => {
     const path = run.startsWith("file://") ? run.slice("file://".length) : run;
-    if (path.includes("://") || !IMAGE_SUFFIX.test(path)) return;
+    if (path.includes("://") || !hasImageSuffix(path)) return;
     if (found.length < limit && !found.includes(path)) found.push(path);
   };
-  // A code span, or the prose up to the next one.
-  for (const [, code, prose] of text.matchAll(/`([^`\n]+)`|([^`]+)/g)) {
-    if (code !== undefined) {
-      for (const run of code.split(/\s+/)) take(run);
+  for (const part of segments(text)) {
+    if (part.isCode) {
+      for (const run of part.text.split(/\s+/)) take(run);
       continue;
     }
-    for (const run of prose!.split(/[\s'"<>[\]{}|*]+/)) {
+    // A backtick left in prose closed no span: it is no part of a path.
+    for (const run of part.text.split(/[\s'"<>[\]{}|*`]+/)) {
       take(unwrap(run.replace(/[.,;:!?]+$/, "")).replace(/[.,;:!?]+$/, ""));
     }
   }
