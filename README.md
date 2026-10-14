@@ -88,13 +88,18 @@ rm -f <temp>...
 `<file>` is the picture: the path you gave `/img`, or for a hover card a file inside the
 working directory that a reply named, and then the mod's copy of it. `<temp>` is a file
 of the mod's own, `$TMPDIR/claude-imgview-<random uuid>` with the suffix `.snap`, `.bmp`
-or `.png`.
+or `.png`. Where `TMPDIR` is unset, empty or not an absolute path the directory is `/tmp`
+(`tempDir` in `hooks/picture.ts`), so a `<temp>` begins with a slash and is no program's
+option.
 
 No program is given an address. A web address in a reply is skipped
 (`path.includes("://")` in `hooks/picture.ts`), and `/img` opens only what the file
 system says is a regular file. What `sips` and ImageMagick do with a file's content is
 theirs: a hover card is made from a bitmap alone, by the format `sips` itself names, but
-`/img` on an SVG you name hands that SVG to them.
+`/img` on an SVG you name hands that SVG to them. To name the format, `sips -g` is run
+on the copy of every mentioned file that passes the checks before it, whatever the copy
+holds: of a PDF named `scan.png` it answers `pdf` and the page's size (seen with the
+`sips` of macOS 14.5), and the file is refused there, before any conversion.
 
 ### What it reads
 
@@ -109,8 +114,8 @@ theirs: a hover card is made from a bitmap alone, by the format `sips` itself na
 
   | Variable                                  | Used for                                                                                                 |
   | ----------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-  | `HOME`                                    | expanding `~` in a path                                                                                  |
-  | `TMPDIR`                                  | where the temporary files go                                                                             |
+  | `HOME`                                    | expanding `~` in a path, when it is an absolute path                                                     |
+  | `TMPDIR`                                  | where the temporary files go, when it is an absolute path                                                |
   | `TERM`, `TERM_PROGRAM`, `KITTY_WINDOW_ID` | whether the terminal is kitty or Ghostty, which draw pixels                                              |
   | `TMUX`                                    | whether it is set: tmux passes no pictures through                                                       |
   | `SSH_CONNECTION`, `SSH_CLIENT`, `SSH_TTY` | whether one is set: across ssh the terminal cannot read this machine's files. Their values are not used. |
@@ -151,15 +156,19 @@ to a word in it (`ui.render` on `AssistantMessage` wraps what `next(e)` drew).
 
 - A reply gets a chip for each of its first four image files (`MAX_CHIPS`): paths
   written bare, in a code span, in a markdown link or as `file://`, ending in `.png`,
-  `.jpg`, `.jpeg`, `.gif`, `.webp`, `.heic`, `.bmp`, `.tif` or `.tiff`. A code span is
-  taken as written; in prose the parentheses around a path are the sentence's. A web
-  address gets none: nothing here fetches. A path with a space in it is not recognised.
+  `.jpg`, `.jpeg`, `.gif`, `.webp`, `.heic`, `.bmp`, `.tif` or `.tiff`. A link is
+  followed, and the file it leads to has to end in one of those too
+  (`hasImageSuffix(found.realPath)`): `shot.png` linked to `notes.pdf`, or to a key,
+  gets no chip. A code span, of one backtick or of two, is taken as written; in prose
+  and in a fenced block the parentheses around a path are the sentence's. A web address
+  gets none: nothing here fetches. A path with a space in it is not recognised.
 - A file outside the working directory gets a chip and no card. The chip's label is the
-  path, the home directory as `~` and of a long path the last 40 characters
-  (`shortenPath`), so you can see the file is elsewhere before you click. Nothing is run
-  for it until you do.
-- A click that opens nothing says why in a toast: the file is gone, it is no picture, or
-  it converts to no PNG.
+  path, the home directory as `~`, and of a path longer than 40 characters the first 13
+  and the last 26 around an ellipsis (`shortenPath`): the start says whose directory the
+  file is in, the end which file it is. A directory name cut by the ellipsis is not
+  whole. Nothing is run for the file until you click.
+- A click that opens nothing says why in a toast: the file is gone, it is no picture, it
+  converts to no PNG, or the pane did not take it (`could not show …, try again`).
 - The card holds at most 80 by 24 cells (`CARD_COLUMNS`, `CARD_ROWS`), fewer columns on
   a terminal narrower than 92. In `cells` mode that is a 160 by 48 pixel thumbnail.
 - The terminal applies a hover by itself and runs no hook for it, so the card cannot be
@@ -167,7 +176,9 @@ to a word in it (`ui.render` on `AssistantMessage` wraps what `next(e)` drew).
 - 32 cards are kept, drawn or waiting their turn (`MAX_THUMBS`). A card that a reply on
   screen draws is in use: a drawn one is not dropped for another, so with more than 32
   pictures on screen the extra mentions get no chip until one of the others scrolls
-  away. A file no preview could draw is remembered apart and holds no card's place.
+  away. The mod then asks for the replies to be drawn again (`freed`), since the engine
+  draws a reply that sits still no other way. A file no preview could draw is remembered
+  apart and holds no card's place.
 - What is on screen is what the engine says is. It draws a reply again when the reply
   comes on screen and when it leaves (`e.props.onScreen`), and not in between, so the
   mod keeps the replies now on screen with the cards each one draws (`onScreen` in
@@ -182,9 +193,12 @@ to a word in it (`ui.render` on `AssistantMessage` wraps what `next(e)` drew).
   scrolls away, and nothing else:
   - A reply taken out of the transcript with no last drawing (a rewind, a compaction)
     goes on holding its cards until the session ends (a `/clear` is one), or until 64
-    other replies that name image files have been drawn on screen after it
-    (`MAX_ON_SCREEN`). While 32 cards are held that way, new mentions get no chip.
-  - With more than 64 replies that name image files on screen at once, the one drawn
+    other replies that asked for a card have been drawn on screen after it
+    (`MAX_ON_SCREEN`). While 32 cards are held that way, new mentions get no chip. A
+    reply asks for a card when it names a file inside the working directory that no
+    preview has refused, whether or not there was room for the card; one whose files
+    are all missing, refused or outside takes no place in the record (`isAsking`).
+  - With more than 64 replies that asked for a card on screen at once, the one drawn
     longest ago stops holding its cards though it is still there.
   - Two terminals attached to one session are one record: a reply one of them reports
     as gone stops holding its cards while the other may still show it.
@@ -206,11 +220,17 @@ click is held to less than what `/img` takes (`locateMention`, `preview` and `sk
 A mention that leads to a regular file outside the session's working directory gets a
 chip and nothing else: the mod has asked the file system what the path leads to and has
 run no program (`isOutside` in `locateMention`; such a file is never given a card,
-`file.isOutside !== true` in the `ui.render` hook). Inside the working directory a
-mention gets a chip only together with its card:
+`file.isOutside !== true` in the `ui.render` hook). Inside the working directory the
+chip is drawn at once, over a card that says `Rendering…`, and the file is then held to
+this table. One that fails it loses its chip at the drawing that follows, and is
+remembered as refused by its path, modification time and card width (`failed`, the
+last 128). A reply drawn off screen, or on a terminal
+that does not say what is on screen, shows its chips with no card and with nothing
+checked: a click on one is the first look at the file, as for a file outside.
 
 | A mention gets a hover card only when                           | Enforced by                                                                     |
 | --------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| the file it leads to, links followed, is named as a bitmap      | `hasImageSuffix(found.realPath)` in `locateMention`, for a chip of any kind     |
 | it lands inside the session's working directory, links followed | `isInside(found.realPath, host.root)`; `host.root` follows `classic.CwdChanged` |
 | the file is at most 20 MiB                                      | `PREVIEW_MAX_BYTES`, on the file before anything runs and again on the copy     |
 | `sips` names the copy's real format a bitmap's                  | `isBitmapFormat(size.format)`: no SVG, no PDF, whatever the name says           |
@@ -244,12 +264,15 @@ How the conversion itself is held:
 - With eight previews given up and still unanswered (`MAX_ABANDONED`), no new card is
   begun, and a mention that has no card yet gets no chip, until one of them answers: a
   mount that has stopped answering costs eight waiting previews, not one for every
-  mention.
+  mention. When one answers the mod asks for the replies to be drawn again (`settle` in
+  `previewInTime`), and the mentions left out get their chips.
 - On a terminal that draws pixels the card shows a small PNG the mod converted from the
   copy, never the file the reply named.
 - When the working directory changes, every card, lookup and waiting conversion made
   under the old one is dropped and the chips on screen are redrawn without them, before
-  anything else happens. Nothing is previewed until the new directory is resolved.
+  anything else happens. Nothing is previewed until the new directory is resolved. A
+  drawing the change came in behind remembers no lookup (`io.root` is asked after the
+  clock has answered) and hands the reply back with no chips (`drawnUnder`).
 
 This stops protecting at three edges:
 
@@ -299,7 +322,8 @@ inside a session. The pane goes through the engine's own two picture elements in
 
 Under tmux and across ssh the mode is `cells` even on kitty: tmux passes no pictures
 through, and the terminal reads the PNG from its own machine's disk, not the remote one.
-In `pixels` mode only a file `sips` names a PNG is handed to the terminal as it is. `--cells`
+In `pixels` mode only a file its converter names a PNG is handed to the terminal as it
+is: `sips`, or ImageMagick's `identify` where `sips` reads no size. `--cells`
 and `--pixels` override the choice; a terminal that cannot draw an `Image` shows its
 caption and a hint to use `--cells`.
 
@@ -320,10 +344,12 @@ Each `/img` runs the converter once to measure the picture and, in `cells` mode,
 per pane size to resize it to exactly the cells on screen: one size at a time, and of
 the sizes a resize passes through meanwhile only the last (`paint`). The resized file
 goes to `$TMPDIR/claude-imgview-*.bmp` and is removed once read. In `pixels` mode a
-file `sips` names a PNG is handed to the terminal by its own path; any other is first
-converted to `$TMPDIR/claude-imgview-*.png`, which is removed when another picture
-replaces it in the pane. A chip's copy (`*.snap`) is removed as soon as its card is drawn, and a card's PNG
-when the card is dropped.
+file its converter names a PNG is handed to the terminal by its own path; any other is
+first converted to `$TMPDIR/claude-imgview-*.png`, which is removed once the pane has
+taken the picture that replaces it (`replace`). Where the pane's state does not take
+the next picture, the PNG made for that one is removed instead and the one on show
+stays. A chip's copy (`*.snap`) is removed as soon as its card is drawn, and a card's
+PNG when the card is dropped.
 
 Every temporary file the mod makes is written down by its path until it is removed
 (`owned` in `hooks/register.tsx`), and that list is copied into the session's state
@@ -333,8 +359,9 @@ only once the mod has found a file there, so a name that turned out to be taken 
 is. A path is struck off once `rm` has exited 0 for it, not when `rm` is started
 (`remove`). When the session ends (`session.end`, in the short time the engine allows
 it), and when the module is loaded again in a running session, the files written down
-are removed by those exact paths (`sweep`), not by a name pattern. This is what can
-still be left behind:
+are removed by those exact paths (`sweep`), not by a name pattern. A bitmap the pane's
+conversion had written and not yet read goes with a sweep too, and the pane converts
+again (`sweeps` in `paint`). This is what can still be left behind:
 
 - The PNG the pane is showing, on purpose: a pane that outlives a `/clear` still needs
   it. It goes when another picture replaces it, or when the system clears `$TMPDIR`.

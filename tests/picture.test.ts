@@ -7,6 +7,7 @@ import {
   expandHome,
   findImagePaths,
   fit,
+  hasImageSuffix,
   fromBase64,
   isBitmapFormat,
   isInside,
@@ -14,6 +15,7 @@ import {
   parseIdentifySize,
   parseSipsSize,
   shortenPath,
+  tempDir,
   toBase64,
   toCells,
 } from "../hooks/picture";
@@ -146,7 +148,7 @@ describe("paths", () => {
     expect(expandHome("~/a.png", undefined)).toBe("~/a.png");
   });
 
-  test("shortens a path for a label: the home directory as a tilde, and of a long path its end", () => {
+  test("shortens a path for a label: the home directory as a tilde, and of a long path both its ends", () => {
     expect(shortenPath("/home/me/shots/a.png", "/home/me", 40)).toBe(
       "~/shots/a.png",
     );
@@ -157,12 +159,59 @@ describe("paths", () => {
     );
     expect(shortenPath("/etc/a.png", undefined, 40)).toBe("/etc/a.png");
     expect(shortenPath("/etc/a.png", "", 40)).toBe("/etc/a.png");
-    // Exactly as long as allowed: whole. One more: an ellipsis and the end.
+    // Exactly as long as allowed: whole. One more: a third of the room for
+    // the start, an ellipsis, and the end in the rest.
     expect(shortenPath("/abc/defg.png", undefined, 13)).toBe("/abc/defg.png");
-    expect(shortenPath("/abcd/defg.png", undefined, 13)).toBe("…bcd/defg.png");
+    expect(shortenPath("/abcd/defg.png", undefined, 13)).toBe("/abc…defg.png");
     expect(shortenPath("/home/me/abcdefgh/a.png", "/home/me", 10)).toBe(
-      "…fgh/a.png",
+      "~/a…/a.png",
     );
+  });
+
+  // Antigravity review, finding 3: its two paths, whose end alone would read
+  // as a project of the person's.
+  test("keeps the start of a long path in the label, where it says whose directory the file is in", () => {
+    const hidden = shortenPath(
+      "/tmp/untrusted/Users/alice/my-project/screenshots/login.png",
+      "/Users/alice",
+      40,
+    );
+    expect(hidden).toBe("/tmp/untruste…ject/screenshots/login.png");
+    expect(hidden).toHaveLength(40);
+    const long = shortenPath(
+      "/tmp/evil/very_long_filename_0123456789012345.png",
+      "/Users/alice",
+      40,
+    );
+    expect(long).toBe("/tmp/evil/ver…ename_0123456789012345.png");
+    expect(long).toHaveLength(40);
+  });
+
+  // Antigravity review, finding 7.
+  test("expands no tilde under a home that is no absolute path, and keeps the root a root", () => {
+    expect(expandHome("~/shot.png", "")).toBe("~/shot.png");
+    expect(expandHome("~/shot.png", "me")).toBe("~/shot.png");
+    expect(expandHome("~", "/")).toBe("/");
+    expect(expandHome("~/shot.png", "/")).toBe("/shot.png");
+    expect(expandHome("~/shot.png", "//")).toBe("/shot.png");
+  });
+
+  test("puts temporary files under an absolute TMPDIR, and under /tmp for any other", () => {
+    expect(tempDir("/var/t/")).toBe("/var/t");
+    expect(tempDir("/var/t")).toBe("/var/t");
+    expect(tempDir(undefined)).toBe("/tmp");
+    expect(tempDir("")).toBe("/tmp");
+    expect(tempDir("-rf")).toBe("/tmp");
+    expect(tempDir("relative/dir")).toBe("/tmp");
+    // The root: a name under it still begins with one slash.
+    expect(`${tempDir("/")}/name`).toBe("/name");
+  });
+
+  test("tells a bitmap's file name by its suffix", () => {
+    expect(hasImageSuffix("/work/a.PNG")).toBe(true);
+    expect(hasImageSuffix("/work/payload.pdf")).toBe(false);
+    expect(hasImageSuffix("/home/me/.ssh/id_rsa")).toBe(false);
+    expect(hasImageSuffix("/work/.png")).toBe(false);
   });
 
   test("names a file by its last segment", () => {
@@ -578,6 +627,36 @@ describe("findImagePaths", () => {
     expect(
       findImagePaths("run `sips -Z 64 c.png --out d.png` then (e.png)", 4),
     ).toEqual(["c.png", "d.png", "e.png"]);
+    // Antigravity review, finding 9: a span of two backticks is one span, and
+    // the prose and the span after it are still what they are.
+    expect(
+      findImagePaths("Use ``--out`` for (shot.png) or `a[0].png` ", 4),
+    ).toEqual(["shot.png", "a[0].png"]);
+    expect(findImagePaths("``a`b.png`` then (c.png).", 4)).toEqual([
+      "a`b.png",
+      "c.png",
+    ]);
+    expect(findImagePaths("`a `` b.png` and (d.png)", 4)).toEqual([
+      "b.png",
+      "d.png",
+    ]);
+    // A span closes at a run as long as the one that opened it, no shorter.
+    expect(findImagePaths("``a`(b.png)``", 4)).toEqual([]);
+    // A span keeps to its line: a backtick with none after it on the line
+    // opens nothing, and is no part of the path beside it.
+    expect(findImagePaths("see `e.png\nand `f.png`", 4)).toEqual([
+      "e.png",
+      "f.png",
+    ]);
+    expect(findImagePaths("(see `i.png)\n(and j.png) `x`", 4)).toEqual([
+      "i.png",
+      "j.png",
+    ]);
+    // A fenced block's lines are read as prose.
+    expect(
+      findImagePaths("```bash\nopen out/g.png;\n```\nthen (h.png).", 4),
+    ).toEqual(["out/g.png", "h.png"]);
+    expect(findImagePaths("```out/k.png;```", 4)).toEqual(["out/k.png"]);
     expect(findImagePaths("an unclosed ` before (f.png)", 4)).toEqual([
       "f.png",
     ]);
